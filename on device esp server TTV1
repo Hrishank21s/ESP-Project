@@ -1,0 +1,351 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <map>
+#include <vector>
+#include <cmath>
+#include <ctime>
+
+// Wi-Fi credentials (requested)
+const char* WIFI_SSID = "SSID";
+const char* WIFI_PASSWORD = "Pass";
+
+AsyncWebServer server(80);
+AsyncEventSource events("/events"); // SSE endpoint
+
+// Data models
+struct User { String id, username, password, role; };
+struct Session { String start_time, end_time, date, user; float duration, amount; };
+struct Table {
+  String status, time, session_start_time, pause_time;
+  float rate, amount;
+  unsigned long startMillis, elapsedSeconds;
+  std::vector<Session> sessions;
+};
+
+// State
+std::map<int, Table> snooker;
+std::map<int, Table> pool;
+std::map<String, User> users;
+std::vector<float> available_rates = {2.0,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5};
+
+// Auth (LAN demo)
+bool isLogged(AsyncWebServerRequest*) { return true; }
+bool isAdmin(AsyncWebServerRequest*) { return true; }
+
+// Time helpers
+String nowHMS(){
+  time_t nowsec=time(nullptr); struct tm* tm_info=localtime(&nowsec);
+  char buf[3]; if(tm_info) strftime(buf,9,"%H:%M:%S",tm_info); else snprintf(buf,9,"00:00:00");
+  return String(buf);
+}
+String todayYMD(){
+  time_t nowsec=time(nullptr); struct tm* tm_info=localtime(&nowsec);
+  char buf[20]; if(tm_info) strftime(buf,11,"%Y-%m-%d",tm_info); else snprintf(buf,11,"1970-01-01");
+  return String(buf);
+}
+Table makeTable(float rate){
+  Table t; t.status="idle"; t.time="00:00"; t.rate=rate; t.amount=0.0f;
+  t.startMillis=0; t.elapsedSeconds=0; t.session_start_time=""; t.pause_time=""; return t;
+}
+void initData(){
+  snooker[21]=makeTable(3.0f); snooker[22]=makeTable(4.0f); snooker[23]=makeTable(4.5f);
+  pool[21]=makeTable(2.0f); pool[22]=makeTable(2.0f); pool[23]=makeTable(2.5f);
+  users["admin"]=User{"admin","admin","admin123","admin"};
+  users["staff1"]=User{"staff1","staff1","staff123","staff"};
+}
+
+// Minimal JSON body capture
+String bodyBuf;
+String jsonGetString(const String& key){
+  String pat="\""+key+"\""; int i=bodyBuf.indexOf(pat); if(i<0) return "";
+  int c=bodyBuf.indexOf(':',i); if(c<0) return ""; int q1=bodyBuf.indexOf('"',c+1); if(q1<0) return "";
+  int q2=bodyBuf.indexOf('"',q1+1); if(q2<0) return ""; return bodyBuf.substring(q1+1,q2);
+}
+float jsonGetFloat(const String& key){
+  String pat="\""+key+"\""; int i=bodyBuf.indexOf(pat); if(i<0) return NAN;
+  int c=bodyBuf.indexOf(':',i); if(c<0) return NAN; int j=c+1; while(j<(int)bodyBuf.length()&&bodyBuf[j]==' ') j++;
+  int e=j; while(e<(int)bodyBuf.length()&&(isdigit(bodyBuf[e])||bodyBuf[e]=='.'||bodyBuf[e]=='-')) e++;
+  return bodyBuf.substring(j,e).toFloat();
+}
+int jsonGetInt(const String& key){ return (int)round(jsonGetFloat(key)); }
+
+// JSON builder
+String tableToJson(const Table& t){
+  String s="{\"status\":\""+t.status+"\",\"time\":\""+t.time+"\",\"rate\":"+String(t.rate,2)+",\"amount\":"+String(t.amount,2)+",\"sessions\":[";
+  for(size_t i=0;i<t.sessions.size();++i){
+    const Session& x=t.sessions[i];
+    s+="{\"start_time\":\""+x.start_time+"\",\"end_time\":\""+x.end_time+"\",\"duration\":"+String(x.duration,1)+",\"amount\":"+String(x.amount,2)+",\"date\":\""+x.date+"\",\"user\":\""+x.user+"\"}";
+    if(i+1<t.sessions.size()) s+=",";
+  }
+  s+="]}"; return s;
+}
+String snapshotJson(){
+  String s="{\"success\":true,\"snooker\":{"; size_t k=0;
+  for(auto &p: snooker){ s+="\""+String(p.first)+"\":"+tableToJson(p.second); if(++k<snooker.size()) s+=","; }
+  s+="},\"pool\":{"; k=0; for(auto &p: pool){ s+="\""+String(p.first)+"\":"+tableToJson(p.second); if(++k<pool.size()) s+=","; }
+  s+="},\"available_rates\":[";
+  for(size_t i=0;i<available_rates.size();++i){ s+=String(available_rates[i],1); if(i+1<available_rates.size()) s+=","; }
+  s+="],\"timestamp\":\""+String(millis())+"\"}";
+  return s;
+}
+String tablesSnapshotJson(const std::map<int,Table>& m){
+  String s="{\"success\":true,\"tables\":{"; size_t k=0;
+  for(auto &p:m){ s+="\""+String(p.first)+"\":"+tableToJson(p.second); if(++k<m.size()) s+=","; }
+  s+="},\"available_rates\":[";
+  for(size_t i=0;i<available_rates.size();++i){ s+=String(available_rates[i],1); if(i+1<available_rates.size()) s+=","; }
+  s+="],\"timestamp\":\""+String(millis())+"\"}";
+  return s;
+}
+
+// Start/Pause/End logic (device-owned)
+void handleAction(std::map<int,Table>& tables, int id, const String& action, const String& user){
+  if(!tables.count(id)) return;
+  Table& t=tables[id]; unsigned long nowms=millis();
+  if(action=="start"){
+    if(t.status=="idle"){ t.status="running"; t.startMillis=nowms; t.elapsedSeconds=0; t.session_start_time=nowHMS(); t.pause_time=""; }
+    else if(t.status=="paused"){ t.status="running"; t.startMillis=nowms; t.pause_time=""; }
+  } else if(action=="pause"){
+    if(t.status=="running"){ unsigned long sec=(nowms-t.startMillis)/1000; t.elapsedSeconds+=sec; t.status="paused"; t.pause_time=nowHMS(); }
+  } else if(action=="end"){
+    if(t.status=="running"){ unsigned long sec=(nowms-t.startMillis)/1000; t.elapsedSeconds+=sec; }
+    if(t.status=="running"||t.status=="paused"){
+      float minutes=t.elapsedSeconds/60.0f; float amount=minutes*t.rate;
+      Session s{ t.session_start_time.length()?t.session_start_time:String("00:00:00"), nowHMS(), todayYMD(), user, roundf(minutes*10)/10.0f, roundf(amount*100)/100.0f };
+      t.sessions.push_back(s);
+      t.status="idle"; t.time="00:00"; t.amount=0.0f; t.startMillis=0; t.elapsedSeconds=0; t.session_start_time=""; t.pause_time="";
+    }
+  }
+}
+
+// 1s device tick: compute live time/amount for running tables and push SSE
+void updateTick(){
+  static unsigned long last=0; unsigned long now=millis();
+  if(now - last >= 1000){
+    last = now;
+    auto upd=[&](std::map<int,Table>& m){
+      for(auto &p:m){
+        Table &t=p.second;
+        if(t.status=="running" && t.startMillis>0){
+          unsigned long secRun=(now - t.startMillis)/1000;
+          unsigned long total=t.elapsedSeconds + secRun;
+          unsigned long minutes=total/60, seconds=total%60;
+          char buf[24]; snprintf(buf, sizeof(buf), "%02lu:%02lu", minutes, seconds);
+          t.time=String(buf);
+          float amt=(total/60.0f)*t.rate; t.amount=roundf(amt*100)/100.0f;
+        }
+      }
+    };
+    upd(snooker); upd(pool);
+    // Push one merged snapshot to all clients
+    events.send(snapshotJson().c_str(), "update", millis());
+  }
+}
+
+// Minimal UI (embedded, no LittleFS required)
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Weekend Rush Table Tracker</title>
+<style>
+:root{color-scheme:dark light}
+body{font-family:system-ui,Arial,sans-serif;margin:1rem auto;max-width:980px;padding:0 1rem;background:#0d0f12;color:#e6e8eb}
+h1{font-size:1.3rem} section{border:1px solid #2a2f36;border-radius:10px;padding:1rem;margin:.8rem 0;background:#15191e}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{border:1px solid #2a2f36;border-radius:10px;padding:.75rem;background:#11161b}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+label{display:block;font-size:.9rem;margin:6px 0 2px}
+input,select,button{width:100%;padding:9px 10px;border-radius:8px;border:1px solid #39424d;background:#0e1216;color:#e6e8eb}
+button{background:#1b2530;cursor:pointer} button:hover{background:#223040}
+.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:.8rem;background:#223040;border:1px solid #2a2f36}
+small{color:#93a1af}
+</style></head><body>
+<h1>ESP32 Table Tracker</h1>
+<section>
+  <div class="row">
+    <div><label>Game</label><select id="game"><option>snooker</option><option>pool</option></select></div>
+    
+  </div>
+</section>
+<section><div class="grid" id="tables"></div></section>
+<script>
+const $=s=>document.querySelector(s);
+let useSSE=true, es=null, pollT=null;
+
+async function api(path, opts={}){ const r=await fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts)); return r.json(); }
+
+function renderGame(game, data){
+  const j = data[game]; const rates=data.available_rates||[];
+  const grid = $('#tables'); grid.innerHTML='';
+  Object.keys(j).forEach(id=>{
+    const t=j[id];
+    const card=document.createElement('div'); card.className='card';
+    card.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>${game.toUpperCase()} ${id}</strong> <span class="badge">${t.status}</span>
+      </div>
+      <div style="margin:6px 0">Time: <strong>${t.time}</strong> | Rate: ₹${t.rate}/min | Amount: <strong>₹${t.amount}</strong></div>
+      <div class="row">
+        <button onclick="act('${game}',${id},'start')">Start/Resume</button>
+        <button onclick="act('${game}',${id},'pause')">Pause</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button onclick="act('${game}',${id},'end')">End</button>
+        <button onclick="clearSessions('${game}',${id})">Clear Sessions</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div><label>New rate</label><select id="rate_${game}_${id}">${rates.map(r=>`<option ${r==t.rate?'selected':''}>${r}</option>`).join('')}</select></div>
+        <div style="align-self:end"><button onclick="setRate('${game}',${id})">Update Rate</button></div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div><label>Players</label><input id="players_${game}_${id}" type="number" min="1" max="50" value="2"/></div>
+        <div style="align-self:end"><button onclick="splitBill('${game}',${id})">Split</button></div>
+      </div>
+      <div style="margin-top:8px"><small>Sessions:</small><br>${(t.sessions||[]).map(s=>`${s.start_time}-${s.end_time} | ₹${s.amount}`).join('<br>')}</div>
+    `;
+    grid.appendChild(card);
+  });
+}
+async function loadOnce(){
+  const g=$('#game').value;
+  const snap=await api('/api/snapshot');
+  renderGame(g, snap);
+}
+async function act(g,id,a){ await api(`/api/${g}/table/action`,{method:'POST',body:JSON.stringify({id,action:a})}); }
+async function setRate(g,id){ const rate=parseFloat($(`#rate_${g}_${id}`).value); await api(`/api/${g}/table/rate`,{method:'POST',body:JSON.stringify({id,rate})}); }
+async function clearSessions(g,id){ await api(`/api/${g}/table/clear`,{method:'POST',body:JSON.stringify({id})}); }
+async function splitBill(g,id){ const players=parseInt($(`#players_${g}_${id}`).value)||2; const r=await api(`/api/${g}/table/split`,{method:'POST',body:JSON.stringify({id,players})}); if(r.error) alert(r.error); else alert(`Each: ₹${r.per_player.toFixed(2)} (Total ₹${r.total_amount.toFixed(2)})`); }
+
+function startSSE(){
+  if(es) es.close();
+  es=new EventSource('/events');
+  es.addEventListener('update', e=>{ const snap=JSON.parse(e.data); renderGame($('#game').value, snap); });
+}
+function startPoll(){
+  if(pollT) clearInterval(pollT);
+  pollT=setInterval(loadOnce, 1000);
+}
+function wire(){
+  $('#game').addEventListener('change', ()=>{ loadOnce(); });
+  $('#mode').addEventListener('change', ()=>{
+    useSSE = $('#mode').value === 'sse';
+    if(useSSE){ if(pollT) clearInterval(pollT); startSSE(); }
+    else { if(es) es.close(); startPoll(); }
+  });
+  loadOnce();
+  startSSE();
+}
+document.addEventListener('DOMContentLoaded', wire);
+</script>
+</body></html>
+)HTML";
+
+void setup(){
+  Serial.begin(115200);
+  initData();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting");
+  while(WiFi.status()!=WL_CONNECTED){ delay(500); Serial.print('.'); }
+  Serial.println(); Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  // CORS for dev
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin","*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers","content-type");
+
+  // Pages
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req){ req->send_P(200,"text/html",INDEX_HTML); });
+
+  // SSE connect
+  events.onConnect([](AsyncEventSourceClient *client){
+    // Send initial snapshot immediately
+    client->send(snapshotJson().c_str(), "update", millis());
+  });
+  server.addHandler(&events);
+
+  // Body handler
+  auto bodyHandler=[](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total){
+    if(index==0) bodyBuf=""; bodyBuf.reserve(total); bodyBuf.concat((const char*)data, len);
+  };
+
+  // Snapshots
+  server.on("/api/snapshot", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200,"application/json", snapshotJson());
+  });
+  server.on("/api/snooker/tables", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200,"application/json", tablesSnapshotJson(snooker));
+  });
+  server.on("/api/pool/tables", HTTP_GET, [](AsyncWebServerRequest* req){
+    req->send(200,"application/json", tablesSnapshotJson(pool));
+  });
+
+  // Actions
+  server.on("/api/snooker/table/action", HTTP_POST, [](AsyncWebServerRequest* req){
+    String a=jsonGetString("action"); int id=jsonGetInt("id");
+    if(!snooker.count(id) || (a!="start"&&a!="pause"&&a!="end")){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    handleAction(snooker,id,a,"staff1"); req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+  server.on("/api/pool/table/action", HTTP_POST, [](AsyncWebServerRequest* req){
+    String a=jsonGetString("action"); int id=jsonGetInt("id");
+    if(!pool.count(id) || (a!="start"&&a!="pause"&&a!="end")){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    handleAction(pool,id,a,"staff1"); req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+
+  // Rate
+  server.on("/api/snooker/table/rate", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"); float r=jsonGetFloat("rate");
+    if(!snooker.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    if(snooker[id].status!="idle"){ req->send(400,"application/json","{\"error\":\"busy\"}"); return; }
+    bool ok=false; for(float rr: available_rates) if(fabs(rr-r)<0.001f) ok=true;
+    if(!ok){ req->send(400,"application/json","{\"error\":\"rate\"}"); return; }
+    snooker[id].rate=r; req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+  server.on("/api/pool/table/rate", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"); float r=jsonGetFloat("rate");
+    if(!pool.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    if(pool[id].status!="idle"){ req->send(400,"application/json","{\"error\":\"busy\"}"); return; }
+    bool ok=false; for(float rr: available_rates) if(fabs(rr-r)<0.001f) ok=true;
+    if(!ok){ req->send(400,"application/json","{\"error\":\"rate\"}"); return; }
+    pool[id].rate=r; req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+
+  // Clear
+  server.on("/api/snooker/table/clear", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"); if(!snooker.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    snooker[id].sessions.clear(); req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+  server.on("/api/pool/table/clear", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"); if(!pool.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    pool[id].sessions.clear(); req->send(200,"application/json","{\"success\":true}");
+  }, NULL, bodyHandler);
+
+  // Split
+  server.on("/api/snooker/table/split", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"), players=jsonGetInt("players");
+    if(!snooker.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    if(players<1||players>50){ req->send(400,"application/json","{\"error\":\"players\"}"); return; }
+    Table& t=snooker[id]; if(t.sessions.empty()){ req->send(400,"application/json","{\"error\":\"nosessions\"}"); return; }
+    float total=t.sessions.back().amount, per=total/players;
+    String j="{\"success\":true,\"total_amount\":"+String(total,2)+",\"players\":"+String(players)+",\"per_player\":"+String(per,2)+"}";
+    req->send(200,"application/json",j);
+  }, NULL, bodyHandler);
+  server.on("/api/pool/table/split", HTTP_POST, [](AsyncWebServerRequest* req){
+    int id=jsonGetInt("id"), players=jsonGetInt("players");
+    if(!pool.count(id)){ req->send(400,"application/json","{\"error\":\"invalid\"}"); return; }
+    if(players<1||players>50){ req->send(400,"application/json","{\"error\":\"players\"}"); return; }
+    Table& t=pool[id]; if(t.sessions.empty()){ req->send(400,"application/json","{\"error\":\"nosessions\"}"); return; }
+    float total=t.sessions.back().amount, per=total/players;
+    String j="{\"success\":true,\"total_amount\":"+String(total,2)+",\"players\":"+String(players)+",\"per_player\":"+String(per,2)+"}";
+    req->send(200,"application/json",j);
+  }, NULL, bodyHandler);
+
+  // 404
+  server.onNotFound([](AsyncWebServerRequest* r){ r->send(404,"text/plain","Not found"); });
+
+  server.begin();
+  Serial.println("Server started");
+}
+
+void loop(){ updateTick(); }
